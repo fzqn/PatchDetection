@@ -1,0 +1,169 @@
+import pandas as pd
+import requests
+import time
+import json
+from tqdm import tqdm
+from sklearn.metrics import precision_score, accuracy_score, f1_score, confusion_matrix
+from dataloader import *
+from prompt import *
+
+# Configuration settings
+CONFIG = {
+    "api_key": "YOUR_API_KEY_HERE",  # Replace with your Deepseek API key
+    "api_endpoint": "YOUR_API_ENDPOINT_HERE",  # Replace with your Deepseek API endpoint
+    "model_name": "deepseek-reasoner",  # Model to call (e.g., deepseek-reasoner)
+    "input_file": "patch_db.json",  # Update with your local dataset path
+    "output_file": "DS_Pllmsecurity_patch_predictions.json",
+    "final_metrics_file": "DS_Pllm_final_experiment_metrics.txt",
+    "batch_size": 500,  # Batch size parameter (retained for context)
+    "retry_limit": 3,
+    "request_interval": 1.5  # Seconds between requests
+}
+
+
+def predict_with_deepseek(prompts, df):
+    """Calls the Deepseek API for prediction"""
+    predictions = []
+
+    with tqdm(total=len(prompts), desc="Predicting") as pbar:
+        for i, prompt in enumerate(prompts):
+            headers = {
+                "Authorization": f"Bearer {CONFIG['api_key']}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": CONFIG["model_name"],
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.01,
+            }
+            print(f"\nProcessing sample {i}: ")
+
+            prediction = 1  # Default prediction is non-security related
+            for retry in range(CONFIG["retry_limit"]):
+                try:
+                    response = requests.post(
+                        CONFIG["api_endpoint"],
+                        headers=headers,
+                        json=payload,
+                        timeout=60
+                    )
+                    response.raise_for_status()
+                    answer = response.json()["choices"][0]["message"]["content"].strip().lower()
+                    prediction = parse_answer(answer)  # Get the prediction result directly
+                    # print(f"Large model response: {answer}") # Kept for debugging if needed
+                    print(f"API Response: {answer}")
+                    # Modified output message for clarity
+                    print(f"Prediction: {'Security-related (1)' if prediction == 1 else 'Non-security-related (0)'}")
+                    break  # Exit retry loop on success
+                except Exception as e:
+                    if retry == CONFIG["retry_limit"] - 1:
+                        print(f"Failed to process sample {i}: {str(e)}")
+                    time.sleep(2 ** retry)  # Exponential backoff for retries
+            predictions.append(prediction)
+            time.sleep(CONFIG["request_interval"])
+            pbar.update(1)
+
+    return predictions
+
+
+def parse_answer(answer):
+    """Parses the prediction result from the model's response"""
+    answer = answer.lower()
+
+    # Extract prediction (Yes/No)
+    if "yes" in answer:
+        prediction = 1
+    elif "no" in answer:
+        prediction = 0
+    else:
+        # Default to non-security related if the answer is ambiguous (can be adjusted)
+        prediction = 0
+
+    return prediction
+
+
+def calculate_metrics(df):
+    """Calculates evaluation metrics"""
+    metrics = {
+        "precision": precision_score(df["is_security"], df["prediction"], zero_division=0),
+        "accuracy": accuracy_score(df["is_security"], df["prediction"]),
+        "f1": f1_score(df["is_security"], df["prediction"], zero_division=0),
+    }
+    tn, fp, fn, tp = confusion_matrix(df["is_security"], df["prediction"]).ravel()
+    metrics["fpr"] = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+
+    # Adding TP, FP, TN, FN for complete output
+    metrics["tp"] = int(tp)
+    metrics["fp"] = int(fp)
+    metrics["tn"] = int(tn)
+    metrics["fn"] = int(fn)
+
+    return metrics
+
+
+def print_metrics(metrics):
+    """Prints evaluation metrics"""
+    print("\nEvaluation Results:")
+    print(f"Precision: {metrics['precision']:.4f}")
+    print(f"Accuracy: {metrics['accuracy']:.4f}")
+    print(f"F1-Score: {metrics['f1']:.4f}")
+    print(f"False Positive Rate: {metrics['fpr']:.4f}")
+    print(
+        f"TP: {metrics['tp']}, FP: {metrics['fp']}, TN: {metrics['tn']}, FN: {metrics['fn']}")  # Print all confusion matrix elements
+
+
+def save_final_results(df, metrics):
+    """Saves the final results and metrics"""
+    # Save the complete results
+    df["model"] = CONFIG["model_name"]
+    df.to_json(CONFIG["output_file"], orient="records", lines=True)
+
+    # Save evaluation metrics to a dedicated final metrics file
+    with open(CONFIG["final_metrics_file"], "w") as f:
+        f.write("Final Experiment Metrics:\n")
+        f.write("-" * 30 + "\n")
+        f.write(f"Model: {CONFIG['model_name']}\n")
+        f.write(f"Dataset: {CONFIG['input_file']}\n")
+        f.write(f"Precision: {metrics['precision']:.4f}\n")
+        f.write(f"Accuracy: {metrics['accuracy']:.4f}\n")
+        f.write(f"F1-Score: {metrics['f1']:.4f}\n")
+        f.write(f"False Positive Rate: {metrics['fpr']:.4f}\n")
+        f.write(f"True Positives (TP): {metrics['tp']}\n")
+        f.write(f"False Positives (FP): {metrics['fp']}\n")
+        f.write(f"True Negatives (TN): {metrics['tn']}\n")
+        f.write(f"False Negatives (FN): {metrics['fn']}\n")
+        f.write(f"Confusion Matrix:\n")
+        f.write(f"  [ TP: {metrics['tp']}  |  FP: {metrics['fp']} ]\n")
+        f.write(f"  [ FN: {metrics['fn']}  |  TN: {metrics['tn']} ]\n")
+
+    print(f"\nFinal results saved to {CONFIG['final_metrics_file']}")
+
+
+def main():
+    """Main function"""
+    # Load data
+    built_prompt = built_baseprompt
+    print("Loading data...")
+    df = load_data(CONFIG, built_prompt)
+    print(f"Loaded {len(df)} samples")
+
+    # Execute prediction
+    predictions = predict_with_deepseek(df["prompt"].tolist(), df)
+    df["prediction"] = predictions
+
+    # Calculate final metrics
+    print("\nCalculating final metrics...")
+    final_metrics = calculate_metrics(df)
+    print("\nFinal Evaluation Results:")
+    print_metrics(final_metrics)
+
+    # Save final results and metrics
+    save_final_results(df, final_metrics)
+
+    # Note: The original line saving to "predictions.json" is redundant if output_file is used,
+    # but kept here if it serves a specific purpose.
+    df.to_json("predictions.json", orient="records", lines=True)
+
+
+if __name__ == "__main__":
+    main()
